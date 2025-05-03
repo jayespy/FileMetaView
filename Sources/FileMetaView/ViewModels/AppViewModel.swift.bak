@@ -1,0 +1,403 @@
+import Foundation
+import SwiftUI
+import Combine
+import os.log
+
+/// Main view model for the application, handling state management and business logic
+class AppViewModel: ObservableObject {
+    // MARK: - Published Properties
+    
+    /// The currently selected file
+    @Published var selectedFile: FileReference?
+    
+    /// The metadata items extracted from the selected file
+    @Published var metadata: [MetadataItem] = []
+    
+    /// Whether metadata is currently being loaded
+    @Published var isLoading: Bool = false
+    
+    /// Any error that occurred during file selection or metadata extraction
+    @Published var error: FileAccessError?
+    
+    /// Search text for filtering metadata items
+    @Published var searchText: String = ""
+    
+    /// Whether the error alert is currently showing
+    @Published var showingError: Bool = false
+    
+    /// Whether the permission request is being shown
+    @Published var showingPermissionRequest: Bool = false
+    
+    /// URL for permission request
+    @Published var permissionRequestURL: URL? = nil
+    
+    /// Whether the unsupported file type dialog is being shown
+    @Published var showingUnsupportedFileType: Bool = false
+    
+    /// URL of the unsupported file
+    @Published var unsupportedFileURL: URL? = nil
+    
+    /// Whether the file drop target is active
+    @Published var isDropTargetActive: Bool = false
+    
+    /// Whether to attempt extraction on unsupported file types
+    @Published var allowUnsupportedFileTypes: Bool = false
+    
+    /// Selected metadata categories for filtering
+    @Published var selectedCategories: Set<MetadataCategory> = Set(MetadataCategory.allCases)
+    
+    // MARK: - Dependencies
+    
+    /// Service for handling file selection
+    let fileSelectionService: FileSelectionService
+    
+    /// Factory for creating metadata extractors
+    let extractorFactory: MetadataExtractorFactory
+    
+    /// Logger for the view model
+    private let logger = Logger(subsystem: "com.example.FileMetaView", category: "AppViewModel")
+    
+    // MARK: - Internal State
+    
+    /// Private stored metadata before filtering
+    private var allMetadata: [MetadataItem] = []
+    
+    /// Set to store subscription cancellables
+    private var cancellables = Set<AnyCancellable>()
+    
+    // MARK: - Initialization
+    
+    /// Initialize the view model with dependencies
+    /// - Parameters:
+    ///   - fileSelectionService: Service for handling file selection
+    ///   - extractorFactory: Factory for creating metadata extractors
+    init(
+        fileSelectionService: FileSelectionService = FileSystemSelectionService(),
+        extractorFactory: MetadataExtractorFactory = MetadataExtractorFactory()
+    ) {
+        self.fileSelectionService = fileSelectionService
+        self.extractorFactory = extractorFactory
+        
+        // Set up search text filtering
+        $searchText
+            .debounce(for: .milliseconds(300), scheduler: RunLoop.main)
+            .removeDuplicates()
+            .sink { [weak self] _ in
+                self?.filterMetadata()
+            }
+            .store(in: &cancellables)
+        
+        // Set up category filtering
+        $selectedCategories
+            .sink { [weak self] _ in
+                self?.filterMetadata()
+            }
+            .store(in: &cancellables)
+        
+        logger.info("AppViewModel initialized")
+    }
+    
+    // MARK: - Public Methods
+    
+    /// Select a file using the file selection service
+    /// - Returns: True if selection was successful, false otherwise
+    @MainActor
+    func selectFile() async -> Bool {
+        // Reset state
+        isLoading = true
+        error = nil
+        
+        do {
+            logger.info("Initiating file selection")
+            let file = try await fileSelectionService.selectFile()
+            
+            // Update the selected file
+            selectedFile = file
+            logger.info("File selected: \(file.name)")
+            
+            // Load metadata for the selected file
+            await loadMetadata()
+            isLoading = false
+            return true
+        } catch let selectionError as FileAccessError {
+            // Only show error if it's not a user cancellation
+            if case .operationCancelled = selectionError {
+                logger.info("File selection cancelled by user")
+            } else {
+                handleError(selectionError)
+            }
+            isLoading = false
+            return false
+        } catch {
+            // Handle any other errors
+            handleError(FileAccessError.from(error: error))
+            isLoading = false
+            return false
+        }
+    }
+    
+    /// Handle a file drop operation
+    /// - Parameter url: The URL of the dropped file
+    /// - Returns: True if the drop was handled successfully, false otherwise
+    @MainActor
+    func handleFileDrop(url: URL) async -> Bool {
+        // Reset state
+        isLoading = true
+        error = nil
+        
+        do {
+            logger.info("Handling dropped file: \(url.lastPathComponent)")
+            let file = try fileSelectionService.handleFileDropped(url: url)
+            
+            // Update the selected file
+            selectedFile = file
+            logger.info("Dropped file accepted: \(file.name)")
+            
+            // Load metadata for the selected file
+            await loadMetadata()
+            isLoading = false
+            return true
+        } catch {
+            // Handle any errors
+            handleError(error as? FileAccessError ?? FileAccessError.from(error: error))
+            isLoading = false
+            return false
+        }
+    }
+    
+    /// Load metadata for the currently selected file
+    @MainActor
+    func loadMetadata() async {
+        guard let file = selectedFile else {
+            logger.warning("Cannot load metadata: No file selected")
+            return
+        }
+        
+        // Reset state
+        isLoading = true
+        error = nil
+        allMetadata = []
+        metadata = []
+        
+        do {
+            logger.info("Loading metadata for file: \(file.name)")
+            
+            // Get the extraction result from the factory
+            let result = try await extractorFactory.extractMetadata(from: file)
+            
+            // Update state with the extracted metadata
+            allMetadata = result.items
+            logger.info("Loaded \(result.items.count) metadata items")
+            
+            // Apply any warnings to the log
+            for warning in result.warnings {
+                logger.warning("\(warning)")
+            }
+            
+            // Filter the metadata based on current filters
+            filterMetadata()
+        } catch {
+            // Handle any errors
+            handleError(error as? FileAccessError ?? FileAccessError.from(error: error, url: file.url))
+            
+            // Clear metadata if loading failed
+            allMetadata = []
+            metadata = []
+        }
+        
+        // Always reset loading state
+        isLoading = false
+    }
+    
+    /// Refresh metadata for the current file
+    @MainActor
+    func refreshMetadata() async {
+        guard let file = selectedFile else { return }
+        
+        // Create a new file reference to ensure we get fresh metadata
+        selectedFile = file.refreshMetadata()
+        
+        // Reload metadata
+        await loadMetadata()
+    }
+    
+    /// Clears the currently selected file and metadata
+    func clearSelection() {
+        selectedFile = nil
+        allMetadata = []
+        metadata = []
+        error = nil
+    }
+    
+    /// Filter metadata based on search text and selected categories
+    func filterMetadata() {
+        guard !allMetadata.isEmpty else {
+            metadata = []
+            return
+        }
+        
+        var filteredItems = allMetadata
+        
+        // Filter by selected categories
+        if selectedCategories.count < MetadataCategory.allCases.count {
+            filteredItems = filteredItems.filter { selectedCategories.contains($0.category) }
+        }
+        
+        // Filter by search text
+        if !searchText.isEmpty {
+            let searchTerms = searchText.lowercased().split(separator: " ")
+            
+            filteredItems = filteredItems.filter { item in
+                let keyMatches = searchTerms.allSatisfy { term in
+                    item.key.lowercased().contains(term) ||
+                    item.displayName.lowercased().contains(term)
+                }
+                
+                // Also search in string values
+                if !keyMatches, let stringValue = item.value as? String {
+                    return searchTerms.allSatisfy { stringValue.lowercased().contains($0) }
+                }
+                
+                return keyMatches
+            }
+        }
+        
+        // Update the filtered metadata
+        metadata = filteredItems
+    }
+    
+    /// Group metadata items by category
+    /// - Returns: Dictionary mapping categories to arrays of metadata items
+    func groupMetadataByCategory() -> [MetadataCategory: [MetadataItem]] {
+        var groupedItems: [MetadataCategory: [MetadataItem]] = [:]
+        
+        for item in metadata {
+            if groupedItems[item.category] == nil {
+                groupedItems[item.category] = []
+            }
+            groupedItems[item.category]?.append(item)
+        }
+        
+        // Sort each category's items
+        for (category, items) in groupedItems {
+            groupedItems[category] = items.sorted { $0.displayName < $1.displayName }
+        }
+        
+        return groupedItems
+    }
+    
+    /// Get metadata items for a specific category
+    /// - Parameter category: The category to filter by
+    /// - Returns: Array of metadata items in the requested category
+    func metadataForCategory(_ category: MetadataCategory) -> [MetadataItem] {
+        return metadata.filter { $0.category == category }
+                       .sorted { $0.displayName < $1.displayName }
+    }
+    
+    /// Get the number of items in each category
+    /// - Returns: Dictionary mapping categories to counts
+    func categoryItemCounts() -> [MetadataCategory: Int] {
+        var counts: [MetadataCategory: Int] = [:]
+        
+        for item in metadata {
+            counts[item.category, default: 0] += 1
+        }
+        
+        return counts
+    }
+    
+    /// Get an array of categories that have items
+    /// - Returns: Array of metadata categories with non-zero item counts
+    func categoriesWithItems() -> [MetadataCategory] {
+        let counts = categoryItemCounts()
+        return MetadataCategory.allCases.filter { counts[$0, default: 0] > 0 }
+                               .sorted { $0.sortOrder < $1.sortOrder }
+    }
+    
+    // MARK: - Error Handling
+    
+    /// Handle an error from file operations
+    /// - Parameter error: The error to handle
+    private func handleError(_ error: Error) {
+        // Cast to FileAccessError if possible
+        if let fileError = error as? FileAccessError {
+            self.error = fileError
+            
+            // Special handling for different error types
+            switch fileError {
+            case .permissionDenied(let url, _):
+                // If we have a URL, show the permission request dialog directly
+                if let url = url {
+                    showPermissionRequestForURL(url)
+                    return
+                }
+                
+            case .accessRevoked(let url):
+                // If access was revoked, also show the permission request
+                if let url = url {
+                    showPermissionRequestForURL(url)
+                    return
+                }
+                
+            case .unsupportedFileType(let url, _):
+                // If we have a URL, show the unsupported file type dialog
+                if let url = url {
+                    showUnsupportedFileTypeDialog(for: url)
+                    return
+                }
+                
+            case .insufficientPermissions:
+                // For system-level permissions, we'll let the error view handle
+                // directing the user to system preferences
+                break
+                
+            default:
+                break
+            }
+        } else {
+            // Otherwise create an unknown error
+            self.error = FileAccessError.unknown(error)
+        }
+        
+        // Log the error
+        logger.error("Error: \(self.error?.localizedDescription ?? "Unknown error")")
+        
+        // Show the error alert
+        showingError = true
+    }
+    
+    /// Show permission request for a specific URL
+    /// - Parameter url: The URL to request permission for
+    private func showPermissionRequestForURL(_ url: URL) {
+        permissionRequestURL = url
+        showingPermissionRequest = true
+    }
+    
+    /// Show unsupported file type dialog for a specific URL
+    /// - Parameter url: The URL of the unsupported file
+    private func showUnsupportedFileTypeDialog(for url: URL) {
+        unsupportedFileURL = url
+        showingUnsupportedFileType = true
+    }
+    
+    /// Try to process an unsupported file type anyway
+    /// - Parameter url: The URL of the unsupported file
+    @MainActor
+    func tryProcessUnsupportedFile(_ url: URL) async {
+        // Set the flag to allow unsupported file types
+        allowUnsupportedFileTypes = true
+        
+        // Create a basic file reference
+        let fileReference = FileReference(url: url)
+        
+        // Update the selected file
+        selectedFile = fileReference
+        logger.info("Attempting to process unsupported file: \(fileReference.name)")
+        
+        // Try to load metadata
+        await loadMetadata()
+        
+        // Reset the flag after attempt
+        allowUnsupportedFileTypes = false
+    }
+}
