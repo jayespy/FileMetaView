@@ -9,3 +9,6 @@ DerivedData/
 
 # Exclude compiled app bundle
 *.app
+
+# Exclude documentation folder
+/documentation/
